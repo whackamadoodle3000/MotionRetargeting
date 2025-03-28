@@ -20,7 +20,7 @@ ESTIMATED_REAL_HEIGHT_METERS = 1.7 # <<< ADJUST THIS BASED ON THE PERSON IN THE 
 
 # --- Ground Adjustment ---
 # Set to True to shift coordinates vertically so the lowest foot is at Y=0
-ADJUST_GROUND_CONTACT = False
+ADJUST_GROUND_CONTACT = True
 # Joints considered for ground contact (must be in JOINT_INDICES below)
 GROUND_CONTACT_JOINTS = ['l_foot', 'r_foot']
 
