@@ -5,7 +5,7 @@ import matplotlib.animation as animation
 import numpy as np
 
 # --- Configuration ---
-CSV_FILE_PATH = 'hybrik_keypoints_relative_scaled_grounded.csv'  # <--- CHANGE THIS TO YOUR CSV FILE NAME
+CSV_FILE_PATH = 'hybrik_keypoints_global_swingstop_fk_grounded.csv'  # <--- CHANGE THIS TO YOUR CSV FILE NAME
 SAVE_ANIMATION = False # Set to True to save the animation as an MP4 file
 OUTPUT_FILENAME = 'keypoint_animation_xz_ceiling.mp4'
 ANIMATION_INTERVAL = 50  # milliseconds per frame (e.g., 50ms = 20fps)
