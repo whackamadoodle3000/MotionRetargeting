@@ -6,9 +6,9 @@ import os
 import math
 
 # --- Configuration ---
-PICKLE_FILENAME = "ai.pk"
-# <<< CHANGED FILENAME: Reflects Swing Foot Stop Logic
-OUTPUT_CSV_FILENAME = "hybrik_keypoints_global_swingstop_fk_grounded.csv"
+PICKLE_FILENAME = "ai5.pk" # Use the AI pickle file name
+# <<< CHANGED FILENAME: Reflects Global X Vel Constraint FK
+OUTPUT_CSV_FILENAME = "hybrik_keypoints_global_gblXvel_constraint_fk_rotated.csv"
 
 # Key in the pickle dictionary containing the RELATIVE 3D joint data
 KEYPOINT_DATA_KEY = 'pred_xyz_29'
@@ -18,11 +18,15 @@ IMG_PATH_KEY = 'img_path'
 # --- USER INPUT: Estimate the person's real height in meters ---
 ESTIMATED_REAL_HEIGHT_METERS = 1.7 # <<< ADJUST THIS
 
+# --- Rotation Configuration ---
+APPLY_INITIAL_ROTATION = True
+ROTATION_ANGLE_DEGREES = 7.5 # As in your example
+
 # --- Foot Plant Configuration ---
 STANCE_FOOT_JOINTS = ['l_foot', 'r_foot']
-# Threshold for change in relative X of the SWING foot to consider it landed/stationary
-# Needs tuning! Start potentially slightly larger than before.
-SWING_X_LANDED_THRESHOLD = 0.1 # (Scaled meters per frame)
+# Threshold for change in GLOBAL X of the candidate foot to allow it to become anchor
+# Needs tuning! Units are scaled meters per frame.
+GLOBAL_X_STATIONARY_THRESHOLD = 0.02 # Example value
 
 # --- Ground Adjustment (Y-Axis) ---
 ADJUST_GROUND_CONTACT = True
@@ -41,17 +45,17 @@ JOINT_INDICES = {
 CSV_JOINT_ORDER = ['pelvis', 'l_foot', 'r_foot', 'l_hand', 'r_hand']
 
 # --- Helper to calculate canonical height ---
-def get_canonical_height(relative_coords_frame, ref_joints_indices):
+def get_canonical_height(unrotated_relative_coords_frame, ref_joints_indices):
     try:
         top_idx = ref_joints_indices['top']
         bot1_idx = ref_joints_indices['bottom1']
         bot2_idx = ref_joints_indices['bottom2']
-        num_joints_in_frame = relative_coords_frame.shape[0]
+        num_joints_in_frame = unrotated_relative_coords_frame.shape[0]
         if not all(idx < num_joints_in_frame for idx in [top_idx, bot1_idx, bot2_idx]):
              raise IndexError("Reference joint index out of bounds")
-        top_y = relative_coords_frame[top_idx][1] # Should be 0
-        bottom_y1 = relative_coords_frame[bot1_idx][1]
-        bottom_y2 = relative_coords_frame[bot2_idx][1]
+        top_y = unrotated_relative_coords_frame[top_idx][1] # Should be 0
+        bottom_y1 = unrotated_relative_coords_frame[bot1_idx][1]
+        bottom_y2 = unrotated_relative_coords_frame[bot2_idx][1]
         max_bottom_y = max(bottom_y1, bottom_y2) # Use max Y (closest to 0)
         height = abs(top_y - max_bottom_y)
         return height + 1e-6
@@ -89,9 +93,9 @@ def main():
     max_index_requested = max(all_needed_indices) if all_needed_indices else -1
     if max_index_requested >= num_joints_total: sys.exit(1)
 
-    # --- Calculate Scale Factor ---
+    # --- Calculate Scale Factor (using UNROTATED data) ---
     # ... (Scale factor calculation remains the same) ...
-    print("Calculating scaling factor...")
+    print("Calculating scaling factor (using original orientation)...")
     ref_joints_for_height_names = { 'top': 'pelvis', 'bottom1': 'l_foot', 'bottom2': 'r_foot' }
     ref_joint_indices_for_height = {}
     try: ref_joint_indices_for_height = { k: JOINT_INDICES[v] for k, v in ref_joints_for_height_names.items() }
@@ -101,107 +105,138 @@ def main():
     scale_factor = ESTIMATED_REAL_HEIGHT_METERS / canonical_height
     print(f"  Calculated Scale Factor: {scale_factor:.4f}")
 
+    # --- Pre-calculate Rotation components ---
+    cos_theta = 1.0
+    sin_theta = 0.0
+    if APPLY_INITIAL_ROTATION:
+        angle_rad = math.radians(-ROTATION_ANGLE_DEGREES) # Clockwise rotation
+        cos_theta = math.cos(angle_rad)
+        sin_theta = math.sin(angle_rad)
+        print(f"Applying initial rotation of {ROTATION_ANGLE_DEGREES} deg clockwise around X-axis to relative poses.")
+
     # Get image paths if available
     img_paths = data.get(IMG_PATH_KEY)
     if img_paths is not None and isinstance(img_paths, np.ndarray): img_paths = img_paths.tolist()
 
-    # --- Forward Kinematics Reconstruction (Swing Foot Stop Anchor Switch) ---
-    print("Reconstructing global trajectory using swing foot stop logic...")
-    global_positions_all_frames = []
-    scaled_relative_all_frames = [] # Store scaled relative poses
 
-    # Pre-calculate all scaled relative coordinates
+    # --- Pre-process Relative Data: Scale and Rotate ---
+    print("Pre-processing relative data (scaling and initial rotation)...")
+    processed_relative_all_frames = [] # Stores scaled AND rotated relative poses
     for frame_idx in range(num_frames):
-        frame_scaled_relative = {}
+        frame_processed_relative = {}
         for joint_name, joint_idx in JOINT_INDICES.items():
             relative_coords = relative_keypoint_data[frame_idx, joint_idx, :]
             scaled_coords = relative_coords * scale_factor
             if joint_name == 'pelvis': scaled_coords = np.array([0.0, 0.0, 0.0])
-            frame_scaled_relative[joint_name] = scaled_coords
-        scaled_relative_all_frames.append(frame_scaled_relative)
+            final_relative_coords = scaled_coords
+            if APPLY_INITIAL_ROTATION and joint_name != 'pelvis':
+                x, y, z = scaled_coords[0], scaled_coords[1], scaled_coords[2]
+                rotated_y = y * cos_theta - z * sin_theta
+                rotated_z = y * sin_theta + z * cos_theta
+                final_relative_coords = np.array([x, rotated_y, rotated_z])
+            frame_processed_relative[joint_name] = final_relative_coords
+        processed_relative_all_frames.append(frame_processed_relative)
+
+    # --- Reconstruction driven by Global X Velocity Constraint ---
+    print("Reconstructing global trajectory using global X velocity constraint...")
+    global_positions_all_frames = []
 
     # --- Initialization for Frame 0 ---
     current_global_coords_frame0 = {}
-    initial_scaled_relative = scaled_relative_all_frames[0]
+    initial_processed_relative = processed_relative_all_frames[0] # Use scaled+rotated
 
-    # Initial anchor heuristic: Foot with smaller relative X
-    l_foot_x0_rel = initial_scaled_relative['l_foot'][0]
-    r_foot_x0_rel = initial_scaled_relative['r_foot'][0]
+    # Initial anchor heuristic: Foot with smaller relative X (before rotation maybe better? Using processed for now)
+    l_foot_x0_rel = initial_processed_relative['l_foot'][0]
+    r_foot_x0_rel = initial_processed_relative['r_foot'][0]
     anchor_foot_name = 'l_foot' if l_foot_x0_rel <= r_foot_x0_rel else 'r_foot'
     print(f"Initial anchor foot (heuristic): {anchor_foot_name}")
 
-    # Initial grounding (based on Max Y / closest to 0 in initial frame)
+    # Initial grounding (based on Max Y in processed relative frame)
     # ... (Initial grounding logic remains the same) ...
     y_shift_0 = 0.0
     if ADJUST_GROUND_CONTACT:
         max_y_feet_0_rel = float('-inf')
+        grounding_foot_0 = None
         for gc_joint in GROUND_CONTACT_JOINTS:
-            foot_y_0_rel = initial_scaled_relative[gc_joint][1]
-            if foot_y_0_rel > max_y_feet_0_rel: max_y_feet_0_rel = foot_y_0_rel
-        y_shift_0 = -max_y_feet_0_rel
+            foot_y_0_rel = initial_processed_relative[gc_joint][1]
+            if foot_y_0_rel > max_y_feet_0_rel:
+                 max_y_feet_0_rel = foot_y_0_rel
+                 grounding_foot_0 = gc_joint # Track which foot determined the ground
+        if grounding_foot_0 is not None:
+             y_shift_0 = -max_y_feet_0_rel
+        else:
+             print("Warning: Could not determine grounding foot for frame 0", file=sys.stderr)
+
     initial_pelvis_pos_global = np.array([0.0, y_shift_0, 0.0])
-    for joint_name, scaled_rel_pos in initial_scaled_relative.items():
-         current_global_coords_frame0[joint_name] = initial_pelvis_pos_global + scaled_rel_pos
+    for joint_name, processed_rel_pos in initial_processed_relative.items():
+         current_global_coords_frame0[joint_name] = initial_pelvis_pos_global + processed_rel_pos
     global_positions_all_frames.append(current_global_coords_frame0.copy())
+
 
     # --- Loop through Frames 1 to N-1 ---
     for frame_idx in range(1, num_frames):
+        # Get data for calculation
         prev_global_coords = global_positions_all_frames[frame_idx - 1]
-        prev_scaled_relative = scaled_relative_all_frames[frame_idx - 1]
-        current_scaled_relative = scaled_relative_all_frames[frame_idx]
+        current_processed_relative = processed_relative_all_frames[frame_idx] # Use scaled+rotated
 
-        # anchor_foot_name is carried over from the PREVIOUS frame's decision
+        # anchor_foot_name is the anchor used to calculate THIS frame's position
 
+        # Calculate current GLOBAL PELVIS position (X, Z based on anchor foot)
         anchor_pos_global_prev = prev_global_coords[anchor_foot_name]
-        anchor_pos_relative_current = current_scaled_relative[anchor_foot_name]
-
-        # --- Calculate current GLOBAL PELVIS position (X, Z based on anchor) ---
+        anchor_pos_relative_current = current_processed_relative[anchor_foot_name]
         pelvis_X_current = anchor_pos_global_prev[0] - anchor_pos_relative_current[0]
         pelvis_Z_current = anchor_pos_global_prev[2] - anchor_pos_relative_current[2]
-        pelvis_Y_est = prev_global_coords['pelvis'][1] # Carry over Y for now
-        # --- End Pelvis Calculation ---
+        pelvis_Y_est = prev_global_coords['pelvis'][1] # Carry over Y estimate
 
         pelvis_pos_global_current_est = np.array([pelvis_X_current, pelvis_Y_est, pelvis_Z_current])
 
         # Calculate UNADJUSTED global positions for all joints
         current_global_coords_unadjusted = {}
         for joint_name in JOINT_INDICES.keys():
-            scaled_relative_pos = current_scaled_relative[joint_name]
-            current_global_coords_unadjusted[joint_name] = pelvis_pos_global_current_est + scaled_relative_pos
+            processed_relative_pos = current_processed_relative[joint_name]
+            current_global_coords_unadjusted[joint_name] = pelvis_pos_global_current_est + processed_relative_pos
 
         # Apply Y-axis grounding for the current frame
-        # ... (Y grounding logic remains the same) ...
         y_shift_current = 0.0
-        current_global_coords = {}
+        current_global_coords = {} # Final grounded coords for this frame
         if ADJUST_GROUND_CONTACT:
             max_y_feet_current_unadj = float('-inf')
+            grounding_foot_this_frame = None
             for gc_joint in GROUND_CONTACT_JOINTS:
                 foot_y_current_unadj = current_global_coords_unadjusted[gc_joint][1]
-                if foot_y_current_unadj > max_y_feet_current_unadj: max_y_feet_current_unadj = foot_y_current_unadj
-            if max_y_feet_current_unadj != float('-inf'): y_shift_current = -max_y_feet_current_unadj
-            else: print(f"Warning: Could not find grounding foot Y for frame {frame_idx}", file=sys.stderr)
+                if foot_y_current_unadj > max_y_feet_current_unadj:
+                    max_y_feet_current_unadj = foot_y_current_unadj
+                    grounding_foot_this_frame = gc_joint
+            if grounding_foot_this_frame is not None:
+                 y_shift_current = -max_y_feet_current_unadj
+            else:
+                 print(f"Warning: Could not find grounding foot Y for frame {frame_idx}", file=sys.stderr)
+
         shift_vector = np.array([0, y_shift_current, 0])
         for joint_name, unadj_pos in current_global_coords_unadjusted.items():
              current_global_coords[joint_name] = unadj_pos + shift_vector
 
-        # Store the final grounded global coordinates
+        # Store the final grounded global coordinates for THIS frame
         global_positions_all_frames.append(current_global_coords.copy())
 
-        # --- Determine the anchor foot for the NEXT iteration (Swing Foot Stop Logic) ---
-        swing_foot_name = 'r_foot' if anchor_foot_name == 'l_foot' else 'l_foot'
-
-        # Calculate CHANGE in relative X for the swing foot
-        swing_foot_rel_x_prev = prev_scaled_relative[swing_foot_name][0]
-        swing_foot_rel_x_curr = current_scaled_relative[swing_foot_name][0]
-        delta_swing_rel_x = abs(swing_foot_rel_x_curr - swing_foot_rel_x_prev)
-
-        # Decide next anchor
+        # --- Determine the anchor foot for the NEXT iteration (Constraint: Lowest Y AND Low Global X Vel) ---
+        candidate_foot_name = 'r_foot' if anchor_foot_name == 'l_foot' else 'l_foot'
         next_anchor_foot_name = anchor_foot_name # Default: stick with current anchor
-        if delta_swing_rel_x < SWING_X_LANDED_THRESHOLD:
-            # The swing foot has slowed down enough relative to the pelvis,
-            # assume it has landed and become the new anchor.
-            next_anchor_foot_name = swing_foot_name
-            # print(f"Frame {frame_idx}: Anchor switch! {anchor_foot_name} -> {next_anchor_foot_name} (SwingDelta:{delta_swing_rel_x:.4f} < Thresh:{SWING_X_LANDED_THRESHOLD})") # Debug
+
+        # Check relative Y condition: Is the candidate foot lower or equal?
+        candidate_rel_y = current_processed_relative[candidate_foot_name][1]
+        anchor_rel_y = current_processed_relative[anchor_foot_name][1]
+
+        if candidate_rel_y >= anchor_rel_y: # Candidate is lower or at same level (max Y is lowest)
+            # Check global X velocity condition for the candidate foot
+            candidate_global_x_curr = current_global_coords[candidate_foot_name][0]
+            candidate_global_x_prev = prev_global_coords[candidate_foot_name][0]
+            delta_candidate_global_x = abs(candidate_global_x_curr - candidate_global_x_prev)
+
+            if delta_candidate_global_x < GLOBAL_X_STATIONARY_THRESHOLD:
+                # Candidate foot is low AND stationary in X -> Switch anchor
+                next_anchor_foot_name = candidate_foot_name
+                # print(f"Frame {frame_idx}: Anchor switch! {anchor_foot_name} -> {next_anchor_foot_name} (CandLowY:{candidate_rel_y:.3f}>={anchor_rel_y:.3f}, CandDeltaX:{delta_candidate_global_x:.4f} < Thresh)") # Debug
 
         # Update anchor foot for the next loop iteration
         anchor_foot_name = next_anchor_foot_name
@@ -209,7 +244,7 @@ def main():
 
 
     # --- Write results to CSV ---
-    print(f"Writing reconstructed global trajectory (SwingStop FK, Grounded) to '{OUTPUT_CSV_FILENAME}'...")
+    print(f"Writing reconstructed global trajectory (GblXVel Constraint FK, Grounded, Rotated) to '{OUTPUT_CSV_FILENAME}'...")
     # ... (CSV writing logic remains the same) ...
     header = ['frame']
     if img_paths is not None: header.append('img_path')
