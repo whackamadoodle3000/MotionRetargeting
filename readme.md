@@ -29,4 +29,5 @@ This repository contains scripts to process and visualize 3D keypoint data gener
 ## Scripts
 
 *   `extract_keypoints_fk.py`: Extracts and processes keypoints from HybrIK's `.pkl` output, and will create reconstructed 3d translation based on when the feet contact the ground and are stationary in the non-depth axises.
-*   `plot_3d_kps.py`: Visualizes the extracted 3D keypoints from the CSV file. 
+*   `plot_3d_kps.py`: Visualizes the extracted 3D keypoints from the CSV file.
+*   `IK_BaselineComparison/InverseKinematics.py`: This script performs a baseline comparison using inverse kinematics (IK)-based retargeting for robot motion, given 3D keypoints as input. 
